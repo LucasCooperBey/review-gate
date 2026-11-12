@@ -8,6 +8,8 @@
 - Treat a usage limit, rate limit, quota, 429, or "try again" reply as an infra WARN that names the limit, only when the reply has no verdict. A reply with a verdict always stands, so limit words in a REJECT or in the diff cannot let a push through. In auto mode, try the next reviewer and print which one ran, or that none was left.
 - Keep only verdict, bugs, summary and e2e_present from the reviewer's reply, so a reply cannot mark itself as an infra error.
 - A reviewer that cannot start (for example, no execute permission) is an infra WARN instead of a crash.
+- Auto moves to the next reviewer after any infra error (a timeout, a reviewer that cannot start), not only a usage limit.
+- An unknown `REVIEW_GATE_AUTHOR` value is named on screen instead of being dropped silently.
 - `--stats` leaves docs-only SKIP rows and the panel's combined row out of the scored count, and prints the skipped count.
 - Skip docs-only changes: print the skip line, list the non-source files, log SKIP, and exit 0.
 - `--stats` adds a per-reviewer line (reviews, REJECT count, finding rate) and, when panel records exist, a disagreement count. `--round N` (default 1) is stored on each spine record.

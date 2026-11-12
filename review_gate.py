@@ -505,17 +505,25 @@ def auto_candidates(author: str | None) -> tuple[list[str], str | None]:
 
 
 def _take_review(name: str, state: dict, launch) -> dict | None:
-    """Run one reviewer. A usage limit is remembered so auto can try the next."""
+    """Run one reviewer. Any infra error (a usage limit, a timeout, a reviewer that
+    cannot start) is remembered so auto can try the next reviewer."""
     verdict = launch(name)
-    marker = verdict.get("limit_marker")
-    if verdict.get("infra_error") and marker:
-        state["limited"].append((name, marker))
+    if verdict.get("infra_error"):
+        marker = verdict.get("limit_marker")
+        if marker:
+            why = f"hit {marker}"
+        else:
+            why = "failed (" + str(verdict.get("summary", "")).split(" -- ")[0] + ")"
+        state["limited"].append((name, why))
         state["last"] = verdict
         return None
     if state["limited"]:
-        detail = ", ".join(f"{who} hit {why}" for who, why in state["limited"])
-        print(f"review-gate: {detail}; ran {name}")
+        print(f"review-gate: {_limited_detail(state)}; ran {name}")
     return verdict
+
+
+def _limited_detail(state: dict) -> str:
+    return ", ".join(f"{who} {why}" for who, why in state["limited"])
 
 
 def run_auto(author: str | None, diff_text: str, files: list[str], classification: dict,
@@ -541,8 +549,7 @@ def run_auto(author: str | None, diff_text: str, files: list[str], classificatio
         if verdict is not None:
             return verdict
     if state["last"] is not None:
-        detail = ", ".join(f"{who} hit {why}" for who, why in state["limited"])
-        print(f"review-gate: {detail}; no other reviewer is available")
+        print(f"review-gate: {_limited_detail(state)}; no other reviewer is available")
         return state["last"]
     return launch("claude")
 
@@ -660,9 +667,13 @@ def print_summary(verdict: dict, files: list[str]) -> None:
 def _author_name(args) -> str | None:
     if getattr(args, "author", None):
         return args.author
-    raw = os.environ.get("REVIEW_GATE_AUTHOR", "").strip().lower()
+    given = os.environ.get("REVIEW_GATE_AUTHOR", "").strip()
+    raw = given.lower()
     if raw in ("claude", "codex", "other"):
         return raw
+    if given:
+        print(f"review-gate: REVIEW_GATE_AUTHOR={given!r} is not claude, codex or other; "
+              "treated as unset, so the reviewer may be the author's own family")
     return None
 
 

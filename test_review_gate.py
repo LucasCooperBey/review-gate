@@ -312,7 +312,7 @@ def _run(repo, args, which_map, replies=None, handler=None, env=None):
 
     old_cwd = os.getcwd()
     old_argv = sys.argv[:]
-    saved_env = {key: os.environ.get(key) for key in _GATE_ENV}
+    saved_env = {key: os.environ.get(key) for key in set(_GATE_ENV) | set(env or {})}
     old_out, old_err = sys.stdout, sys.stderr
     buf_out, buf_err = io.StringIO(), io.StringIO()
     try:
@@ -785,9 +785,65 @@ def test_stats_leave_out_skips_and_combined_records():
         tmp.cleanup()
 
 
+def test_auto_tries_the_next_reviewer_after_a_timeout():
+    # source: 11-12 pre-push review of this repo: auto moved on only after a usage limit, so a timed-out or
+    # logged-out cross-family reviewer let the push through unreviewed while claude was installed
+    tmp, repo = _init_repo(_code_commits())
+
+    def handler(cmd, **kwargs):
+        kind = _exe_kind(cmd)
+        if kind == "codex":
+            raise subprocess.TimeoutExpired(cmd, 180)
+        if kind == "claude":
+            body = _verdict_json("REJECT", "zero")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"type": "result", "result": body}), stderr="")
+        raise AssertionError(f"unexpected reviewer command: {cmd!r}")
+
+    try:
+        code, out, err, calls = _run(
+            repo, ["--reviewer", "auto", "--author", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"}, handler=handler,
+        )
+        assert [_exe_kind(cmd) for cmd, _ in calls] == ["codex", "claude"], calls
+        assert "review-gate: codex failed (reviewer timed out after 180s); ran claude" in out, out
+        assert code == 1, out
+    finally:
+        tmp.cleanup()
+
+
+def test_an_unknown_author_value_is_named():
+    # source: 11-12 pre-push review of this repo: REVIEW_GATE_AUTHOR="Claude Code" was silently read as unset,
+    # so a Claude-written change got a Claude review with no notice
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        code, out, err, calls = _run(
+            repo, ["--reviewer", "auto", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"}, {"claude": ("PASS", "clean")},
+            env={"REVIEW_GATE_AUTHOR": "Claude Code"},
+        )
+        assert code == 0, out
+        assert "REVIEW_GATE_AUTHOR='Claude Code' is not claude, codex or other" in out, out
+    finally:
+        tmp.cleanup()
+
+
+def test_run_helper_restores_every_variable_it_sets():
+    # source: 11-12 pre-push review of this repo: _run set HOME for one test and never put it back
+    before = os.environ.get("HOME")
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        _run(repo, ["--reviewer", "claude", "--range", "HEAD~1..HEAD"],
+             {"claude": "/usr/bin/claude"}, {"claude": ("PASS", "clean")},
+             env={"HOME": "/nonexistent-review-gate-home"})
+        assert os.environ.get("HOME") == before
+    finally:
+        tmp.cleanup()
+
+
 if __name__ == "__main__":
     import sys
-    fns =[(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
     for name, fn in fns:
         try:
