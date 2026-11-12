@@ -2,6 +2,7 @@
 
 ## 2026-11-12
 
+- README: an Example section with a recorded cross-family REJECT (Codex as author, Claude as reviewer) on a change with two planted bugs.
 - Add cross-family reviewers. `--reviewer auto|claude|codex|cmd` and `--author claude|codex|other` choose a reviewer from a different family than the one that wrote the change. Auto uses the author's own family only when no other family is installed or every other family hit a usage limit, and prints that the review is same-family.
 - Add panel mode (`--reviewers` or `REVIEW_GATE_REVIEWERS`). The combined verdict is REJECT if any reviewer returns REJECT, otherwise WARN if any returns WARN or an infra error, otherwise PASS. Each reviewer is logged, plus one combined record with `agreement`.
 - Send the Claude prompt on stdin (`claude -p --model M --output-format json`). The Claude reviewer gets read-only tools (Read, Grep, Glob), no MCP servers, and saves no session of its own, so text inside a diff cannot make it act. Add a Codex reviewer (`codex exec`, read-only sandbox, prompt on stdin, last message written to a file) and a `cmd` reviewer (`REVIEW_GATE_REVIEWER_CMD`).

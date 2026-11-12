@@ -53,6 +53,33 @@ Flags: `--model auto|sonnet|opus` (auto = Sonnet, escalating to Opus when the di
 
 `--model` chooses Sonnet or Opus for the Claude reviewer. `--codex-model` (or `$REVIEW_GATE_CODEX_MODEL`) chooses the Codex model. When it is unset, the Codex command gets no model flag.
 
+## Example
+
+A change marked as written by Codex, which claims to handle an empty list:
+
+```python
+def average(xs):
+    """Mean of xs; returns 0 for an empty list."""
+    total = 0
+    for i in range(1, len(xs)):
+        total += xs[i]
+    return total / len(xs)
+```
+
+`REVIEW_GATE_AUTHOR=codex git push` sends it to the Claude reviewer, and the push stops (this run was recorded on 2026-11-12):
+
+```text
+review-gate [claude/sonnet] -> REJECT: The loop skips the first element, so every non-empty average is wrong, and the empty-list case the docstring claims to handle still raises ZeroDivisionError.
+  - [high] stats.py:4 The loop uses range(1, len(xs)), so it skips xs[0]. ...
+  - [high] stats.py:6 The docstring promises 0 for an empty list, but nothing guards that case. ...
+  - [low] stats.py:3 The hand-rolled loop replaces sum(xs), which is simpler and correct. ...
+  - [med] stats.py:1 The diff adds no test. ...
+
+Push BLOCKED by review-gate. Fix the findings, or override (logged): git push --no-verify
+```
+
+The findings are shortened here. A reviewer can still miss a bug or report one that is not there, so read each finding before you act on it.
+
 ## Cross-family review
 
 Cross-family review means the reviewer is a different model family from the author of the change. You run that review by hand: review, fix or answer each finding, and rerun until the verdict is clean or you stop after three rounds.
