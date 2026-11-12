@@ -1,6 +1,6 @@
 """Tests for review_gate pure logic. Run: python3 test_review_gate.py
 
-No pytest dependency on purpose — this runs in a bare git pre-push hook context
+No pytest dependency on purpose (this runs in a bare git pre-push hook context)
 where only the stdlib python3 is guaranteed. Each test_* function asserts; the
 __main__ runner reports PASS/FAIL and exits non-zero on any failure.
 """
@@ -189,9 +189,605 @@ def test_log_verdict_appends_jsonl_nodes():
         assert rows[1]["summary"].startswith("PASS:")
 
 
+# -- cross-family reviewers -----------------------------------------------------
+
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+_MARKER = "ZERO_WHOLE_IS_COMMON"
+_GATE_ENV = (
+    "REVIEW_GATE_REVIEWER",
+    "REVIEW_GATE_REVIEWERS",
+    "REVIEW_GATE_AUTHOR",
+    "REVIEW_GATE_CODEX_MODEL",
+    "REVIEW_GATE_REVIEWER_CMD",
+    "REVIEW_GATE_SPINE_DIR",
+)
+_REAL_WHICH = rg.shutil.which
+_REAL_RUN = rg.subprocess.run
+
+
+def _exe_kind(cmd):
+    if isinstance(cmd, str):
+        return "cmd"
+    if not cmd:
+        return ""
+    base = os.path.basename(str(cmd[0])).lower()
+    if "claude" in base:
+        return "claude"
+    if "codex" in base:
+        return "codex"
+    return base
+
+
+def _verdict_json(verdict, summary):
+    bugs = ["div0"] if verdict == "REJECT" else []
+    return json.dumps({"verdict": verdict, "bugs": bugs, "summary": summary})
+
+
+def _write_last(cmd, text):
+    if not isinstance(cmd, list) or "--output-last-message" not in cmd:
+        return
+    path = cmd[cmd.index("--output-last-message") + 1]
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _init_repo(commits):
+    tmp = tempfile.TemporaryDirectory()
+    repo = tmp.name
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    for index, files in enumerate(commits, start=1):
+        for rel, content in files.items():
+            path = os.path.join(repo, rel)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            subprocess.run(["git", "add", "--", rel], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=dev@example.com", "-c", "user.name=Dev",
+             "commit", "-q", "-m", f"commit {index}"],
+            cwd=repo, check=True,
+        )
+    return tmp, repo
+
+
+def _code_commits():
+    before = "def add(a, b):\n    return a + b\n"
+    after = (
+        "def add(a, b):\n    return a + b\n\n"
+        "def ratio(part, whole):\n"
+        "    \"\"\"Return part / whole. ZERO_WHOLE_IS_COMMON for a new account.\"\"\"\n"
+        "    return part / whole\n"
+    )
+    return [{"math_helpers.py": before}, {"math_helpers.py": after}]
+
+
+def _spine_nodes(spine):
+    path = os.path.join(spine, "evals.jsonl")
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _run(repo, args, which_map, replies=None, handler=None, env=None):
+    args = list(args)
+    if "--no-log" not in args and "--spine-dir" not in args:
+        args.append("--no-log")
+    calls = []
+
+    def default_handler(cmd, **kwargs):
+        kind = _exe_kind(cmd)
+        verdict, summary = replies[kind]
+        body = _verdict_json(verdict, summary)
+        if kind == "codex":
+            _write_last(cmd, body)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if kind == "claude":
+            outer = json.dumps({"type": "result", "result": body})
+            return subprocess.CompletedProcess(cmd, 0, stdout=outer, stderr="")
+        if kind == "cmd":
+            return subprocess.CompletedProcess(cmd, 0, stdout=body, stderr="")
+        raise AssertionError(f"unexpected reviewer command: {cmd!r}")
+
+    def wrapped(cmd, *pos, **kwargs):
+        if isinstance(cmd, (list, tuple)) and cmd and os.path.basename(str(cmd[0])) == "git":
+            return _REAL_RUN(cmd, *pos, **kwargs)
+        calls.append((cmd, kwargs))
+        if handler is not None:
+            return handler(cmd, **kwargs)
+        return default_handler(cmd, **kwargs)
+
+    def which(cmd, *pos, **kwargs):
+        return which_map.get(cmd)
+
+    old_cwd = os.getcwd()
+    old_argv = sys.argv[:]
+    saved_env = {key: os.environ.get(key) for key in _GATE_ENV}
+    old_out, old_err = sys.stdout, sys.stderr
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    try:
+        for key in _GATE_ENV:
+            os.environ.pop(key, None)
+        if env:
+            for key, value in env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        os.chdir(repo)
+        sys.argv = ["review_gate.py", *args]
+        rg.shutil.which = which
+        rg.subprocess.run = wrapped
+        sys.stdout, sys.stderr = buf_out, buf_err
+        code = rg.main()
+        return code, buf_out.getvalue(), buf_err.getvalue(), calls
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        rg.shutil.which = _REAL_WHICH
+        rg.subprocess.run = _REAL_RUN
+        sys.argv = old_argv
+        os.chdir(old_cwd)
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_auto_picks_codex_when_author_is_claude():
+    # source: Door 28, 11-12: the public gate could only review with Claude, so a Claude Code user got a same-family review
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "auto", "--author", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"},
+            {"claude": ("PASS", "clean"), "codex": ("PASS", "clean")},
+        )
+        assert code == 0, out
+        assert [_exe_kind(cmd) for cmd, _ in calls] == ["codex"]
+        cmd, kwargs = calls[0]
+        assert "exec" in cmd
+        assert "--sandbox" in cmd and cmd[cmd.index("--sandbox") + 1] == "read-only"
+        assert "--output-last-message" in cmd
+        assert cmd[-1] == "-"
+        assert "--model" not in cmd
+        assert all(_MARKER not in str(part) for part in cmd)
+        assert _MARKER in kwargs.get("input", "")
+        assert "PASS" in out
+        assert "same-family" not in out
+    finally:
+        tmp.cleanup()
+
+
+def test_auto_same_family_when_codex_missing():
+    # source: Door 28, 11-12: when no other family is installed, auto uses the author's family and says the review is same-family
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "auto", "--author", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            {"claude": ("PASS", "clean")},
+        )
+        assert code == 0, out
+        assert [_exe_kind(cmd) for cmd, _ in calls] == ["claude"]
+        assert "review-gate: same-family review (claude)" in out
+    finally:
+        tmp.cleanup()
+
+
+def test_panel_reject_when_one_reviewer_rejects():
+    # source: Door 28, 11-12: panel mode is REJECT when any reviewer rejects, including when the first reviewer passed
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewers", "claude,codex", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"},
+            {"claude": ("PASS", "clean"), "codex": ("REJECT", "zero")},
+        )
+        assert [_exe_kind(cmd) for cmd, _ in calls] == ["claude", "codex"]
+        assert "review-gate [combined] -> REJECT:" in out
+        assert code == 1, out
+    finally:
+        tmp.cleanup()
+
+
+def test_panel_agreement_false_logged():
+    # source: Door 28, 11-12: a panel logs one record per reviewer and a combined record with agreement false when verdicts differ
+    tmp, repo = _init_repo(_code_commits())
+    spine = tempfile.TemporaryDirectory()
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewers", "claude,codex", "--spine-dir", spine.name,
+             "--range", "HEAD~1..HEAD", "--round", "1"],
+            {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"},
+            {"claude": ("PASS", "clean"), "codex": ("REJECT", "zero")},
+        )
+        assert code == 1, out
+        nodes = _spine_nodes(spine.name)
+        reviewers = [node["payload"].get("reviewer") for node in nodes]
+        assert reviewers.count("claude") == 1
+        assert reviewers.count("codex") == 1
+        assert reviewers.count("combined") == 1
+        combined = next(node for node in nodes if node["payload"].get("panel"))
+        assert combined["agreement"] is False
+        assert combined["payload"]["agreement"] is False
+        assert [member["verdict"] for member in combined["payload"]["members"]] == ["PASS", "REJECT"]
+        assert all(node.get("round") == 1 for node in nodes)
+        assert all(node["payload"].get("round") == 1 for node in nodes)
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
+def test_claude_reviewer_gets_read_only_tools_and_no_mcp():
+    # source: Door 28 review, 11-12: the reviewer reads a diff an AI wrote, so text in that diff must not be
+    # able to make it edit files or run commands; it keeps read-only tools to look at context
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            {"claude": ("PASS", "clean")},
+        )
+        assert code == 0, out
+        cmd, kwargs = calls[0]
+        assert cmd[cmd.index("--tools") + 1] == "Read,Grep,Glob"
+        assert "--strict-mcp-config" in cmd
+        assert "--no-session-persistence" in cmd
+    finally:
+        tmp.cleanup()
+
+
+def test_claude_prompt_is_stdin_not_argv():
+    # source: Door 28, 11-12: the Claude prompt goes on stdin, so the diff is not a command-line argument
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            {"claude": ("PASS", "clean")},
+        )
+        assert code == 0, out
+        assert len(calls) == 1
+        cmd, kwargs = calls[0]
+        assert isinstance(cmd, list)
+        assert "-p" in cmd
+        assert "--model" in cmd
+        assert "--output-format" in cmd
+        assert "json" in cmd
+        assert all(_MARKER not in str(part) for part in cmd)
+        assert _MARKER in kwargs.get("input", "")
+    finally:
+        tmp.cleanup()
+
+
+def test_cmd_reviewer_runs_env_command():
+    # source: Door 28, 11-12: cmd mode runs REVIEW_GATE_REVIEWER_CMD with the prompt on stdin and parses the reply
+    tmp, repo = _init_repo(_code_commits())
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "cmd", "--range", "HEAD~1..HEAD"],
+            {},
+            handler=lambda cmd, **kwargs: subprocess.CompletedProcess(
+                cmd, 0, stdout=_verdict_json("PASS", "clean"), stderr=""),
+            env={"REVIEW_GATE_REVIEWER_CMD": "ollama run qwen3:14b"},
+        )
+        assert code == 0, out
+        assert len(calls) == 1
+        cmd, kwargs = calls[0]
+        assert cmd == "ollama run qwen3:14b"
+        assert kwargs.get("shell") is True
+        assert kwargs.get("timeout") == 180
+        assert _MARKER in kwargs.get("input", "")
+        assert "PASS" in out
+    finally:
+        tmp.cleanup()
+
+
+def test_auto_says_same_family_when_the_other_family_is_limited():
+    # source: Door 28 real run, 11-12: with codex at its usage limit, auto for a Claude author fell back to
+    # claude and printed only the limit line, so the person was not told the review was same-family
+    tmp, repo = _init_repo(_code_commits())
+
+    def handler(cmd, **kwargs):
+        if _exe_kind(cmd) == "codex":
+            return subprocess.CompletedProcess(cmd, 0, stdout="You hit your usage limit\n", stderr="")
+        outer = json.dumps({"type": "result", "result": _verdict_json("PASS", "clean")})
+        return subprocess.CompletedProcess(cmd, 0, stdout=outer, stderr="")
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "auto", "--author", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"},
+            handler=handler,
+        )
+        assert code == 0, out
+        assert "review-gate: same-family review (claude)" in out
+    finally:
+        tmp.cleanup()
+
+
+def test_auto_usage_limit_on_codex_runs_claude():
+    # source: Door 28, 11-12: a usage-limit reply from Codex in auto mode tries the next reviewer and says which one ran
+    tmp, repo = _init_repo(_code_commits())
+
+    def handler(cmd, **kwargs):
+        kind = _exe_kind(cmd)
+        if kind == "codex":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="You hit your usage limit\n", stderr="")
+        if kind == "claude":
+            body = _verdict_json("PASS", "clean")
+            outer = json.dumps({"type": "result", "result": body})
+            return subprocess.CompletedProcess(cmd, 0, stdout=outer, stderr="")
+        raise AssertionError(f"unexpected reviewer command: {cmd!r}")
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "auto", "--author", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"},
+            handler=handler,
+        )
+        assert [_exe_kind(cmd) for cmd, _ in calls] == ["codex", "claude"]
+        assert "review-gate: codex hit usage limit; ran claude" in out
+        assert code == 0, out
+        assert "PASS" in out
+    finally:
+        tmp.cleanup()
+
+
+def test_docs_only_skip_logs_skip_and_exits_0():
+    # source: Door 28, 11-12: when classify_files says there is no code, skip the reviewer, log SKIP, list the files, and exit 0
+    tmp, repo = _init_repo([
+        {"README.md": "alpha\n", "docs/guide.md": "one\n"},
+        {"README.md": "beta\n", "docs/guide.md": "two\n"},
+    ])
+    spine = tempfile.TemporaryDirectory()
+
+    def handler(cmd, **kwargs):
+        raise AssertionError(f"reviewer should not run: {cmd!r}")
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--range", "HEAD~1..HEAD", "--spine-dir", spine.name, "--round", "4"],
+            {},
+            handler=handler,
+        )
+        assert code == 0, out
+        assert calls == []
+        assert "review-gate: docs-only change, skipped." in out
+        listed = [line for line in out.splitlines() if "non-source files:" in line]
+        assert len(listed) == 1
+        assert "README.md" in listed[0]
+        assert "docs/guide.md" in listed[0]
+        nodes = _spine_nodes(spine.name)
+        assert len(nodes) == 1
+        assert nodes[0]["payload"]["verdict"] == "SKIP"
+        assert nodes[0]["round"] == 4
+        assert nodes[0]["payload"]["round"] == 4
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
+def test_stats_counts_disagreements():
+    # source: Door 28, 11-12: stats counts panels where one family found something the other passed, and prints per-reviewer rates
+    tmp, repo = _init_repo(_code_commits())
+    spine = tempfile.TemporaryDirectory()
+    which = {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"}
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewers", "claude,codex", "--spine-dir", spine.name,
+             "--range", "HEAD~1..HEAD"],
+            which,
+            {"claude": ("PASS", "clean"), "codex": ("REJECT", "zero")},
+        )
+        assert code == 1, out
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewers", "claude,codex", "--spine-dir", spine.name,
+             "--range", "HEAD~1..HEAD"],
+            which,
+            {"claude": ("PASS", "clean"), "codex": ("PASS", "clean")},
+        )
+        assert code == 0, out
+        rg.log_verdict(spine.name, {
+            "verdict": "REJECT",
+            "bugs": ["x"],
+            "summary": "both found issues",
+            "reviewer": "combined",
+            "panel": True,
+            "agreement": False,
+            "members": [
+                {"reviewer": "claude", "verdict": "REJECT", "infra_error": False},
+                {"reviewer": "codex", "verdict": "WARN", "infra_error": False},
+            ],
+        }, {"head_sha": "c" * 40, "round": 1, "reviewer": "combined", "agreement": False})
+        code, out, err, calls = _run(
+            repo, ["--stats", "--spine-dir", spine.name], {},
+        )
+        assert code == 0, err
+        assert "claude: reviews 2, REJECT 0, finding rate 0%" in out
+        assert "codex: reviews 2, REJECT 1, finding rate 50%" in out
+        assert "panel disagreements: 1" in out
+        assert "reviews logged:" in out
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
+def test_a_reject_that_mentions_limits_still_blocks():
+    # source: 11-12 pre-push review of this repo: limit words anywhere in the reply turned a real REJECT
+    # into a fail-open WARN, so a review of rate-limit code could never block
+    tmp, repo = _init_repo(_code_commits())
+    body = json.dumps({"verdict": "REJECT", "bugs": ["the 429 retry loop never stops"],
+                       "summary": "rate limit handler: try again path loops; quota ignored"})
+
+    def handler(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"type": "result", "result": body}), stderr="")
+
+    try:
+        code, out, err, calls = _run(
+            repo, ["--reviewer", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"}, handler=handler,
+        )
+        assert code == 1, out
+        assert "fail-open" not in out, out
+    finally:
+        tmp.cleanup()
+
+
+def test_codex_stderr_echo_cannot_downgrade_a_reject():
+    # source: 11-12 pre-push review of this repo: Codex can echo the prompt, and so the diff, on stderr;
+    # a diff comment saying "usage limit" made a REJECT read as a limit
+    tmp, repo = _init_repo(_code_commits())
+
+    def handler(cmd, **kwargs):
+        _write_last(cmd, _verdict_json("REJECT", "zero"))
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="", stderr="user\n# handles the usage limit, see @@ -429,6 @@\n")
+
+    try:
+        code, out, err, calls = _run(
+            repo, ["--reviewer", "codex", "--range", "HEAD~1..HEAD"],
+            {"codex": "/usr/bin/codex"}, handler=handler,
+        )
+        assert code == 1, out
+    finally:
+        tmp.cleanup()
+
+
+def test_reviewer_keys_cannot_mark_a_verdict_as_infra():
+    # source: 11-12 security review of this repo: parse_verdict kept every key of the reviewer's JSON, so a
+    # reply carrying infra_error and limit_marker was dropped by auto and the next reviewer's PASS shipped
+    tmp, repo = _init_repo(_code_commits())
+    spoof = json.dumps({"verdict": "REJECT", "bugs": ["real bug"], "summary": "bad",
+                        "infra_error": True, "limit_marker": "quota"})
+
+    def handler(cmd, **kwargs):
+        kind = _exe_kind(cmd)
+        if kind == "claude":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"type": "result", "result": spoof}), stderr="")
+        if kind == "codex":
+            _write_last(cmd, _verdict_json("PASS", "clean"))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected reviewer command: {cmd!r}")
+
+    try:
+        code, out, err, calls = _run(
+            repo, ["--reviewer", "auto", "--author", "codex", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"}, handler=handler,
+        )
+        assert code == 1, out
+        assert [_exe_kind(cmd) for cmd, _ in calls] == ["claude"], calls
+    finally:
+        tmp.cleanup()
+
+
+def test_parse_verdict_keeps_only_review_keys():
+    # source: 11-12 security review of this repo: bookkeeping keys must come from the gate, never the reviewer
+    out = rg.parse_verdict(json.dumps({
+        "verdict": "PASS", "bugs": [], "summary": "ok", "e2e_present": True,
+        "infra_error": True, "limit_marker": "quota", "panel": True, "members": [],
+        "agreement": True, "reviewer": "someone", "model": "x", "round": 9,
+    }))
+    assert out["verdict"] == "PASS"
+    assert out["e2e_present"] is True
+    for key in ("infra_error", "limit_marker", "panel", "members", "agreement", "reviewer", "model", "round"):
+        assert key not in out, key
+
+
+def test_a_reviewer_that_cannot_start_is_an_infra_warn():
+    # source: 11-12 pre-push review of this repo: a reviewer binary without execute permission raised
+    # PermissionError, which crashed the hook with a traceback instead of failing open
+    tmp, repo = _init_repo(_code_commits())
+
+    def handler(cmd, **kwargs):
+        raise PermissionError(13, "Permission denied", str(cmd[0]))
+
+    try:
+        code, out, err, calls = _run(
+            repo, ["--reviewer", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"}, handler=handler,
+        )
+        assert code == 0, out
+        assert "could not start" in out, out
+    finally:
+        tmp.cleanup()
+
+
+def test_auto_names_the_limit_when_no_reviewer_is_left():
+    # source: 11-12 pre-push review of this repo: with codex at its limit and no claude installed, auto
+    # returned the limit WARN without saying which reviewer hit it
+    tmp, repo = _init_repo(_code_commits())
+    home = tempfile.TemporaryDirectory()
+
+    def handler(cmd, **kwargs):
+        if _exe_kind(cmd) == "codex":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="You've hit your usage limit\n")
+        raise AssertionError(f"unexpected reviewer command: {cmd!r}")
+
+    try:
+        code, out, err, calls = _run(
+            repo, ["--reviewer", "auto", "--author", "claude", "--range", "HEAD~1..HEAD"],
+            {"codex": "/usr/bin/codex"}, handler=handler, env={"HOME": home.name},
+        )
+        assert code == 0, out
+        assert "review-gate: codex hit usage limit; no other reviewer is available" in out, out
+    finally:
+        home.cleanup()
+        tmp.cleanup()
+
+
+def test_stats_leave_out_skips_and_combined_records():
+    # source: 11-12 pre-push review of this repo: SKIP rows and the panel's combined row were scored as
+    # reviews, so a docs-only push lowered the finding rate and a panel counted twice
+    tmp, repo = _init_repo(_code_commits())
+    spine = tempfile.TemporaryDirectory()
+    try:
+        meta = {"head_sha": "d" * 40, "round": 1}
+        rg.log_verdict(spine.name, {"verdict": "SKIP", "bugs": [], "summary": "docs"}, meta)
+        rg.log_verdict(spine.name, {"verdict": "PASS", "bugs": [], "summary": "ok", "reviewer": "claude"}, meta)
+        rg.log_verdict(spine.name, {"verdict": "REJECT", "bugs": ["x"], "summary": "bad", "reviewer": "codex"}, meta)
+        rg.log_verdict(spine.name, {"verdict": "REJECT", "bugs": ["x"], "summary": "claude PASS; codex REJECT",
+                                    "reviewer": "combined", "panel": True, "agreement": False,
+                                    "members": []}, meta)
+        code, out, err, calls = _run(repo, ["--stats", "--spine-dir", spine.name], {})
+        assert code == 0, err
+        assert "scored (non-infra):    2" in out, out
+        assert "carried >=1 finding:   1" in out, out
+        assert "skipped (docs-only):   1" in out, out
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
 if __name__ == "__main__":
     import sys
-    fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    fns =[(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
     for name, fn in fns:
         try:
@@ -200,7 +796,7 @@ if __name__ == "__main__":
         except AssertionError as e:
             failed += 1
             print(f"FAIL: {name} -- {e!r}")
-        except Exception as e:  # noqa: BLE001 — surface import/logic errors as failures
+        except Exception as e:  # noqa: BLE001: surface import/logic errors as failures
             failed += 1
             print(f"ERROR: {name} -- {type(e).__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")

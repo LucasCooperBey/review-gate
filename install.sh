@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs review-gate as the pre-push hook of the CURRENT git repo.
-# Refuses to overwrite an existing hook (chain it manually instead — see README).
+# Refuses to overwrite an existing hook (chain it manually instead; see README).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
@@ -11,7 +11,7 @@ GITDIR="$(git rev-parse --git-dir 2>/dev/null)" || {
 HOOK="$GITDIR/hooks/pre-push"
 
 if [ -e "$HOOK" ]; then
-  echo "install.sh: $HOOK already exists — refusing to overwrite." >&2
+  echo "install.sh: $HOOK already exists; refusing to overwrite." >&2
   echo "Chain it manually by adding this line to your existing hook:" >&2
   echo "  python3 \"$HERE/review_gate.py\" --pre-push \"\$@\" < /dev/stdin" >&2
   exit 1
@@ -25,6 +25,11 @@ cat > "$HOOK" <<EOF
 # blocking every push. Escape hatches:
 #   REVIEW_GATE_SKIP=1 git push    (skip just the review)
 #   git push --no-verify           (skip ALL pre-push hooks)
+# Optional reviewer environment (inherited from the shell that runs git push):
+#   REVIEW_GATE_REVIEWER=auto|claude|codex|cmd
+#   REVIEW_GATE_AUTHOR=claude|codex|other
+#   REVIEW_GATE_REVIEWERS=claude,codex
+#   REVIEW_GATE_REVIEWER_CMD='command that reads the prompt on stdin'
 set -uo pipefail
 [ "\${REVIEW_GATE_SKIP:-0}" = "1" ] && exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
@@ -34,3 +39,4 @@ EOF
 chmod +x "$HOOK"
 echo "review-gate installed: $HOOK"
 echo "Every 'git push' from this repo now gets a fresh-context review."
+echo "Set REVIEW_GATE_AUTHOR to the family that wrote the change (claude, codex, or other)."
