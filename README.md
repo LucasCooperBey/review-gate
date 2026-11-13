@@ -1,8 +1,51 @@
-# review-gate
+<h1 align="center">review-gate</h1>
+
+<p align="center"><strong>A fresh-context code review on every git push, from the other model family if you want it. REJECT blocks the push.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/LucasCooperBey/100-doors"><img alt="100 Doors: Doors 13 and 28" src="https://img.shields.io/badge/100%20Doors-Doors%2013%20and%2028-f94bf3"></a>
+  <a href="LICENSE"><img alt="license MIT" src="https://img.shields.io/badge/license-MIT-9aff4a"></a>
+  <img alt="python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab">
+  <img alt="dependencies none" src="https://img.shields.io/badge/dependencies-none-9aff4a">
+  <img alt="reviewers Claude · Codex · any CLI" src="https://img.shields.io/badge/reviewers-Claude%20%C2%B7%20Codex%20%C2%B7%20any%20CLI-5ac4bf">
+  <a href="https://github.com/LucasCooperBey/review-gate/commits/main"><img alt="last commit" src="https://img.shields.io/github/last-commit/LucasCooperBey/review-gate?color=9aff4a&label=updated"></a>
+</p>
+
+<p align="center"><a href="#install">Install</a> · <a href="#example">Example</a> · <a href="#cross-family-review">Cross-family review</a> · <a href="#tests">Tests</a> · <a href="https://github.com/LucasCooperBey/100-doors">All 100 Doors</a></p>
 
 Fresh-context adversarial code review on every `git push`. The reviewer can be the Claude Code CLI, the Codex CLI, both as a panel, or any command that reads a prompt on stdin.
 
 Each push is reviewed by a separate process that sees only the diff, the changed-file list, and (optionally) an acceptance spec. It does not see the conversation or editor session that wrote the code. A structured verdict comes back: **REJECT blocks the push** (exit 1), PASS and WARN let it through with the findings printed. Every verdict is appended to a local JSONL log so you can measure how often fresh eyes catch something.
+
+**Who it's for:** solo builders and small teams who let an AI agent write code and want a second opinion that did not write it before the code lands.
+
+## Contents
+
+- [What's inside](#whats-inside)
+- [Why fresh context](#why-fresh-context)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Usage](#usage)
+- [Example](#example)
+- [Cross-family review](#cross-family-review)
+- [Verdict rules given to the reviewer](#verdict-rules-given-to-the-reviewer)
+- [The spine log](#the-spine-log)
+- [Tests](#tests)
+- [Related](#related)
+- [Part of 100 Doors](#part-of-100-doors)
+- [Credits](#credits)
+- [License](#license)
+
+## What's inside
+
+| Path | What it is |
+|---|---|
+| `review_gate.py` | The gate: one Python file, standard library only |
+| `install.sh` | Writes a thin pre-push hook into the current repo |
+| `docs/cross-family-loop.md` | The by-hand loop: review, fix, re-review across model families |
+| `test_review_gate.py` | Hermetic tests, no network: `python3 test_review_gate.py` |
+| `spine/` | Where every verdict is appended as JSONL |
+| `CHANGELOG.md` | What changed and when |
 
 ## Why fresh context
 
@@ -151,9 +194,24 @@ python3 test_review_gate.py   # stdlib-only, hermetic, no network
 - [harness-guard](https://github.com/LucasCooperBey/harness-guard): drop-in safety hooks for agent sessions
 - [shipgate](https://github.com/LucasCooperBey/shipgate): fail-closed secrets and licensing gate for publishing
 
+## Part of 100 Doors
+
+This tool is the gift behind two doors of [100 Doors](https://github.com/LucasCooperBey/100-doors): **Door 13** (fresh eyes on every push) and **Door 28** (review with another model family).
+
+- Door 13 post: [X](https://x.com/i/status/2114228769783447769) · [Skool](https://www.skool.com/sandiegoaistudio/door-13-review-gate)
+- Door 28 and every other door: [the 100 Doors index](https://github.com/LucasCooperBey/100-doors)
+- Related doors: [harness-guard](https://github.com/LucasCooperBey/harness-guard) (Doors 12 and 30), [shipgate](https://github.com/LucasCooperBey/shipgate) (Door 14), [pp2p and pp3p](https://github.com/LucasCooperBey/claude-skills/tree/main/skills/pp2p) (Door 7)
+- The season: [sandiegoaistudio.com/season](https://sandiegoaistudio.com/season)
+
+### Come see it live
+
+If you want to see how this and the rest of the doors open up into my software factory, come to [Sharathon](https://sandiegoaistudio.com/sharathon), San Diego AI Studio's show-your-setup day. Sharathon 3 is Sunday, Nov 15 in La Mesa: [RSVP on Luma](https://luma.com/5y5ju7ud).
+
+## Credits
+
+- Reviews run on the [Claude Code CLI](https://claude.com/claude-code), the Codex CLI, or any command you name
+- Built by [Lucas Cooper-Bey](https://github.com/LucasCooperBey)
+
 ## License
 
 MIT
-
-Made by Lucas Cooper-Bey for 100 Doors, one free tool a day: https://sandiegoaistudio.com/season
-If you like seeing how other builders review their agents' code, San Diego AI Studio runs Sharathon, where people show their own setups: https://www.skool.com/sandiegoaistudio
