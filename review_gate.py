@@ -3,15 +3,19 @@
 
 Classifies a diff, runs a fresh-context reviewer (Claude, Codex, a panel, or a
 command), parses a structured verdict, logs it to an append-only spine, and
-returns an exit code (REJECT -> 1) suitable for a git pre-push hook.
+returns an exit code suitable for a git pre-push hook. REJECT is exit 1. A
+critical path with no usable verdict is exit 3.
 
 Fresh context is the whole point: each review is a separate process that sees
 ONLY the diff + changed-file list + (optional) acceptance spec, never the
 authoring conversation. Auto mode picks a reviewer from a different model
 family than the author when one is installed.
 
-Fail-open on infra error: if the reviewer times out or errors, the gate WARNs and
-ALLOWS (exit 0) with a loud line. The review is additive safety, not the only safety.
+A timeout is retried once at 2.5 times that attempt's budget. The default
+budget scales with diff size. Every attempt and every reviewer share a 900
+second wall. If no usable verdict comes back, the gate allows the push, except
+on a critical path (auth, payment, migration, secrets), where it blocks.
+--fail-open-always restores the blanket allow.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 
 # -- locations ------------------------------------------------------------------
@@ -33,6 +38,17 @@ DEFAULT_SPINE_DIR = os.environ.get("REVIEW_GATE_SPINE_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "spine")
 MAX_DIFF_BYTES = 60_000
 ZERO_SHA = "0" * 40
+
+# -- reviewer budget ------------------------------------------------------------
+# A push is synchronous. MAX_TOTAL_TIMEOUT is the wall across every attempt and
+# every reviewer, so the timeout retry cannot turn the push into a long hang.
+BASE_TIMEOUT = 180
+MAX_TIMEOUT = 600            # ceiling for any single attempt
+MAX_TOTAL_TIMEOUT = 900      # hard wall across all attempts and reviewers
+TIMEOUT_BYTES_PER_SEC = 500  # +1s of default budget per this many diff bytes
+INFRA_RETRY_MULT = 2.5       # one retry at this multiple of the attempt budget
+DEFAULT_TIMEOUT_CAP = 300    # ceiling for the scaled default, not for --timeout
+RETRY_MIN_REMAINING = 30     # skip the retry when the wall has less than this left
 
 # -- classification rules -------------------------------------------------------
 CODE_EXTS = {
@@ -175,9 +191,69 @@ def parse_verdict(text: str) -> dict:
     return out
 
 
-def exit_code_for(verdict: dict) -> int:
-    """REJECT blocks (1); everything else (PASS/WARN) allows (0)."""
-    return 1 if verdict.get("verdict") == "REJECT" else 0
+def had_usable_verdict(verdict: dict) -> bool:
+    """True when the reviewer actually rendered a verdict.
+
+    A timeout, a missing binary, a bad exit, and unparseable output are not
+    usable. Neither may be treated as a completed review.
+    """
+    return not (verdict.get("infra_error") or verdict.get("parse_error"))
+
+
+def default_timeout(diff_bytes: int) -> int:
+    """Budget used when --timeout is omitted.
+
+    180 seconds plus one second per 500 diff bytes, clamped to
+    [BASE_TIMEOUT, DEFAULT_TIMEOUT_CAP]. An explicit --timeout is separate
+    and may go up to MAX_TIMEOUT.
+    """
+    scaled = BASE_TIMEOUT + max(0, int(diff_bytes)) // TIMEOUT_BYTES_PER_SEC
+    return max(BASE_TIMEOUT, min(DEFAULT_TIMEOUT_CAP, scaled))
+
+
+def clamp_attempt_budget(timeout: int, warn: bool = False) -> int:
+    """Clamp one attempt to [1, MAX_TIMEOUT]. warn=True is the CLI boundary."""
+    raw = int(timeout)
+    clamped = max(1, min(raw, MAX_TIMEOUT))
+    if warn and clamped != raw:
+        print(
+            f"review-gate: --timeout {raw}s is outside 1 to {MAX_TIMEOUT} seconds; "
+            f"clamping to {clamped}s.",
+            file=sys.stderr,
+        )
+    return clamped
+
+
+def critical_paths(paths: list[str]) -> list[str]:
+    """Critical files named on a block, at most five, in the given order."""
+    return [path for path in paths if CRITICAL_RE.search(path)][:5]
+
+
+def critical_block_line(paths: list[str]) -> str:
+    """Stderr line when a critical path produced no usable verdict."""
+    shown = ", ".join(critical_paths(paths))
+    return (
+        "review-gate: review could not finish for critical files "
+        f"({shown}). Override this gate with --fail-open-always, "
+        "or skip all hooks with git push --no-verify."
+    )
+
+
+def exit_code_for(verdict: dict, critical: bool = False,
+                  fail_open_always: bool = False, parts: list | None = None) -> int:
+    """REJECT blocks (1). No usable verdict on a critical path blocks (3).
+
+    PASS, WARN, and a non-critical infra failure allow (0). parts is the
+    panel's own verdicts; any usable member means the panel answered.
+    """
+    if verdict.get("verdict") == "REJECT":
+        return 1
+    if not critical or fail_open_always:
+        return 0
+    group = parts if parts is not None else [verdict]
+    if any(had_usable_verdict(part) for part in group):
+        return 0
+    return 3
 
 
 # =====================================================================================
@@ -336,14 +412,57 @@ def _from_process(reviewer: str, model: str, text: str, rc: int, err: str,
     return verdict
 
 
+class _Wall:
+    """Elapsed-time ceiling shared by every attempt and every reviewer."""
+
+    def __init__(self, total: int = MAX_TOTAL_TIMEOUT) -> None:
+        self.deadline = time.monotonic() + total
+
+    def remaining(self) -> float:
+        return self.deadline - time.monotonic()
+
+
+def _budget_for_attempt(timeout: int, wall: _Wall) -> int:
+    """Seconds this attempt may run, or 0 when the wall is already spent."""
+    remaining = wall.remaining()
+    if remaining < 1:
+        return 0
+    return min(int(timeout), MAX_TIMEOUT, int(remaining))
+
+
+def _retry_budget(first: int, remaining: float) -> int:
+    """Seconds for the one timeout retry, or 0 when the wall cannot spare it.
+
+    The retry is skipped when under RETRY_MIN_REMAINING seconds are left.
+    Otherwise the budget is 2.5x the attempt, and neither a single attempt
+    nor the shared wall may be exceeded.
+    """
+    if remaining < RETRY_MIN_REMAINING:
+        return 0
+    allowed = min(int(first * INFRA_RETRY_MULT), MAX_TIMEOUT, remaining)
+    return int(allowed)
+
+
+def _mark_retry(verdict: dict, first: int, second: int) -> dict:
+    verdict["retried"] = True
+    verdict["attempt_budgets"] = [first, second]
+    return verdict
+
+
 def _capture(reviewer: str, model: str, classification: dict, timeout: int,
-             fn, missing_summary: str) -> dict:
-    try:
-        text, rc, err, raw = fn()
-    except subprocess.TimeoutExpired:
+             call, missing_summary: str, wall: _Wall) -> dict:
+    """Run one reviewer. A TimeoutExpired is retried once; other infra is not."""
+    first = _budget_for_attempt(timeout, wall)
+    if first < 1:
         return _infra(
             reviewer, model,
-            f"reviewer timed out after {timeout}s -- allowed (fail-open)",
+            "no time left under the 900s review wall -- no review performed",
+        )
+    try:
+        text, rc, err, raw = call(first)
+    except subprocess.TimeoutExpired:
+        return _after_timeout(
+            reviewer, model, classification, call, missing_summary, wall, first,
         )
     except FileNotFoundError:
         return _infra(reviewer, model, missing_summary)
@@ -353,6 +472,37 @@ def _capture(reviewer: str, model: str, classification: dict, timeout: int,
             f"reviewer could not start: {exc} -- allowed (fail-open)",
         )
     return _from_process(reviewer, model, text, rc, err, raw, classification)
+
+
+def _after_timeout(reviewer: str, model: str, classification: dict, call,
+                   missing_summary: str, wall: _Wall, first: int) -> dict:
+    second = _retry_budget(first, wall.remaining())
+    if second < 1:
+        return _infra(
+            reviewer, model,
+            f"reviewer timed out after {first}s -- no review performed",
+        )
+    print(
+        f"review-gate: reviewer timed out after {first}s; retrying once at {second}s.",
+        file=sys.stderr,
+    )
+    try:
+        text, rc, err, raw = call(second)
+    except subprocess.TimeoutExpired:
+        verdict = _infra(
+            reviewer, model,
+            f"reviewer timed out after {first}s -- no review performed",
+        )
+    except FileNotFoundError:
+        verdict = _infra(reviewer, model, missing_summary)
+    except OSError as exc:
+        verdict = _infra(
+            reviewer, model,
+            f"reviewer could not start: {exc} -- allowed (fail-open)",
+        )
+    else:
+        verdict = _from_process(reviewer, model, text, rc, err, raw, classification)
+    return _mark_retry(verdict, first, second)
 
 
 def run_reviewer(prompt: str, model: str, timeout: int) -> tuple[str, int, str, str]:
@@ -435,30 +585,32 @@ def run_cmd_reviewer(prompt: str, command: str, timeout: int) -> tuple[str, int,
 
 def do_review(diff_text: str, files: list[str], classification: dict,
               spec: str | None, model_override: str | None, timeout: int,
-              truncated: bool) -> dict:
+              truncated: bool, wall: _Wall) -> dict:
     model = choose_model(classification, model_override)
     prompt = build_prompt(diff_text, files, classification, spec, truncated)
     return _capture(
         "claude", model, classification, timeout,
-        lambda: run_reviewer(prompt, model, timeout),
+        lambda budget: run_reviewer(prompt, model, budget),
         "claude binary not found -- allowed (fail-open)",
+        wall,
     )
 
 
 def do_codex_review(diff_text: str, files: list[str], classification: dict,
                     spec: str | None, codex_model: str | None, timeout: int,
-                    truncated: bool) -> dict:
+                    truncated: bool, wall: _Wall) -> dict:
     prompt = build_prompt(diff_text, files, classification, spec, truncated)
     shown = codex_model or "codex"
     return _capture(
         "codex", shown, classification, timeout,
-        lambda: run_codex_reviewer(prompt, codex_model, timeout),
+        lambda budget: run_codex_reviewer(prompt, codex_model, budget),
         "codex binary not found -- allowed (fail-open)",
+        wall,
     )
 
 
 def do_cmd_review(diff_text: str, files: list[str], classification: dict,
-                  spec: str | None, timeout: int, truncated: bool) -> dict:
+                  spec: str | None, timeout: int, truncated: bool, wall: _Wall) -> dict:
     command = os.environ.get("REVIEW_GATE_REVIEWER_CMD", "").strip()
     if not command:
         return _infra(
@@ -468,22 +620,24 @@ def do_cmd_review(diff_text: str, files: list[str], classification: dict,
     prompt = build_prompt(diff_text, files, classification, spec, truncated)
     return _capture(
         "cmd", "cmd", classification, timeout,
-        lambda: run_cmd_reviewer(prompt, command, timeout),
+        lambda budget: run_cmd_reviewer(prompt, command, budget),
         "cmd reviewer not found -- allowed (fail-open)",
+        wall,
     )
 
 
 def run_named(name: str, diff_text: str, files: list[str], classification: dict,
               spec: str | None, model_override: str | None, codex_model: str | None,
-              timeout: int, truncated: bool) -> dict:
+              timeout: int, truncated: bool, wall: _Wall) -> dict:
     if name == "claude":
         return do_review(diff_text, files, classification, spec, model_override,
-                         timeout, truncated)
+                         timeout, truncated, wall)
     if name == "codex":
         return do_codex_review(diff_text, files, classification, spec, codex_model,
-                               timeout, truncated)
+                               timeout, truncated, wall)
     if name == "cmd":
-        return do_cmd_review(diff_text, files, classification, spec, timeout, truncated)
+        return do_cmd_review(diff_text, files, classification, spec, timeout,
+                             truncated, wall)
     return _infra(
         name or "unknown", name or "unknown",
         f"unknown reviewer '{name}' -- allowed (fail-open)",
@@ -528,13 +682,13 @@ def _limited_detail(state: dict) -> str:
 
 def run_auto(author: str | None, diff_text: str, files: list[str], classification: dict,
              spec: str | None, model_override: str | None, codex_model: str | None,
-             timeout: int, truncated: bool) -> dict:
+             timeout: int, truncated: bool, wall: _Wall) -> dict:
     cross, own = auto_candidates(author)
     state: dict = {"limited": [], "last": None}
 
     def launch(name: str) -> dict:
         return run_named(name, diff_text, files, classification, spec,
-                         model_override, codex_model, timeout, truncated)
+                         model_override, codex_model, timeout, truncated, wall)
 
     for name in cross:
         if not reviewer_available(name):
@@ -719,14 +873,53 @@ def _log_one(args, verdict: dict, meta: dict) -> None:
     log_verdict(args.spine_dir, verdict, extra)
 
 
+def _resolve_timeout(args, diff_text: str) -> int:
+    """Explicit --timeout, clamped, or the size-scaled default when omitted.
+
+    `is None`, not truthiness: --timeout 0 is an explicit value and clamps to 1.
+    """
+    if getattr(args, "timeout", None) is None:
+        return default_timeout(len(diff_text.encode("utf-8", "replace")))
+    return clamp_attempt_budget(args.timeout, warn=True)
+
+
+def _fail_open_always(args) -> bool:
+    if getattr(args, "fail_open_always", False):
+        return True
+    return os.environ.get("REVIEW_GATE_FAIL_OPEN_ALWAYS", "").strip() == "1"
+
+
 def _review_common(args, diff_text, files, classification, truncated):
     spec = None
     if args.spec and os.path.exists(args.spec):
         with open(args.spec, encoding="utf-8", errors="replace") as handle:
             spec = handle.read()
     model_override = None if args.model == "auto" else args.model
+    # One wall for every attempt and every reviewer in this run.
+    wall = _Wall()
     return (diff_text, files, classification, spec, model_override,
-            _codex_model_arg(args), args.timeout, truncated)
+            _codex_model_arg(args), _resolve_timeout(args, diff_text), truncated, wall)
+
+
+def _finish_review(args, verdict: dict, meta: dict, files: list[str],
+                   classification: dict, parts: list | None) -> int:
+    code = exit_code_for(
+        verdict,
+        critical=bool(classification.get("critical")),
+        fail_open_always=_fail_open_always(args),
+        parts=parts,
+    )
+    _log_one(args, verdict, meta)
+    print_summary(verdict, files)
+    if code == 3:
+        print(critical_block_line(files), file=sys.stderr)
+        _log_one(args, {
+            "verdict": "BLOCKED_NO_VERDICT",
+            "bugs": [],
+            "summary": "review could not finish on a critical path",
+            "critical_files": critical_paths(files),
+        }, meta)
+    return code
 
 
 def _review_and_report(rng_or_files, args, files, diff_text, truncated, head_sha) -> int:
@@ -756,16 +949,12 @@ def _review_and_report(rng_or_files, args, files, diff_text, truncated, head_sha
             _log_one(args, part, meta)
             print_summary(part, files)
         verdict = combine_verdicts(parts)
-        _log_one(args, verdict, meta)
-        print_summary(verdict, files)
-        return exit_code_for(verdict)
+        return _finish_review(args, verdict, meta, files, classification, parts)
     if single == "auto":
         verdict = run_auto(_author_name(args), *common)
     else:
         verdict = run_named(single, *common)
-    _log_one(args, verdict, meta)
-    print_summary(verdict, files)
-    return exit_code_for(verdict)
+    return _finish_review(args, verdict, meta, files, classification, None)
 
 
 def _cap(diff_text: str) -> tuple[str, bool]:
@@ -847,9 +1036,13 @@ def cmd_stats(args) -> int:
         return 1
     verdicts = [r.get("payload", {}) for r in rows if r.get("type") == "review_verdict"]
     skipped = [v for v in verdicts if v.get("verdict") == "SKIP"]
+    blocked = [v for v in verdicts if v.get("verdict") == "BLOCKED_NO_VERDICT"]
     # Each panel member is logged as its own review; the combined row would count it twice.
+    # BLOCKED_NO_VERDICT is its own row and is never a REJECT.
     real = [v for v in verdicts
-            if not v.get("infra_error") and v.get("verdict") != "SKIP" and not v.get("panel")]
+            if not v.get("infra_error")
+            and v.get("verdict") not in ("SKIP", "BLOCKED_NO_VERDICT")
+            and not v.get("panel")]
     buggy = [v for v in real if v.get("verdict") == "REJECT" or (v.get("bugs"))]
     n = len(real)
     rate = (100.0 * len(buggy) / n) if n else 0.0
@@ -857,6 +1050,7 @@ def cmd_stats(args) -> int:
     print(f"  reviews logged:        {len(verdicts)}")
     print(f"  scored (non-infra):    {n}")
     print(f"  skipped (docs-only):   {len(skipped)}")
+    print(f"  blocked, no verdict:   {len(blocked)}")
     print(f"  carried >=1 finding:   {len(buggy)}")
     print(f"  pre-gate finding rate: {rate:.0f}%   <- how often fresh eyes caught something")
     _print_reviewer_stats(verdicts)
@@ -886,7 +1080,7 @@ def _panel_disagreement(payload: dict) -> bool:
 def _print_reviewer_stats(verdicts: list[dict]) -> None:
     grouped: dict[str, list[dict]] = {}
     for verdict in verdicts:
-        if verdict.get("panel") or verdict.get("verdict") == "SKIP":
+        if verdict.get("panel") or verdict.get("verdict") in ("SKIP", "BLOCKED_NO_VERDICT"):
             continue
         name = verdict.get("reviewer")
         if not name or name == "combined":
@@ -925,7 +1119,13 @@ def main() -> int:
                     help="Codex model (or $REVIEW_GATE_CODEX_MODEL). Default: pass no model flag.")
     ap.add_argument("--round", type=int, default=1,
                     help="loop round stored on each spine record (default 1)")
-    ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--timeout", type=int, default=None,
+                    help="per-attempt budget in seconds (default: 180 plus 1 per "
+                         "500 diff bytes, clamped to 180..300; explicit values "
+                         "clamp to 1..600)")
+    ap.add_argument("--fail-open-always", action="store_true",
+                    help="allow the push even when a critical path got no usable "
+                         "verdict (also REVIEW_GATE_FAIL_OPEN_ALWAYS=1)")
     ap.add_argument("--spec", help="path to an acceptance spec to check the diff against")
     ap.add_argument("--spine-dir", default=DEFAULT_SPINE_DIR)
     ap.add_argument("--no-log", action="store_true")
@@ -941,7 +1141,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     # Fail-open on the gate's OWN errors: exit 1 must mean "reviewed and REJECTed",
-    # never "the gate crashed". A bug in here must not block every push.
+    # and exit 3 must mean "no usable verdict on a critical path".
+    # A bug in here must not block every push.
     try:
         sys.exit(main())
     except SystemExit:

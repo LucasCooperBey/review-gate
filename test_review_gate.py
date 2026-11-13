@@ -207,6 +207,7 @@ _GATE_ENV = (
     "REVIEW_GATE_CODEX_MODEL",
     "REVIEW_GATE_REVIEWER_CMD",
     "REVIEW_GATE_SPINE_DIR",
+    "REVIEW_GATE_FAIL_OPEN_ALWAYS",
 )
 _REAL_WHICH = rg.shutil.which
 _REAL_RUN = rg.subprocess.run
@@ -260,6 +261,12 @@ def _init_repo(commits):
             cwd=repo, check=True,
         )
     return tmp, repo
+
+
+def _auth_commits():
+    before = "def check():\n    return True\n"
+    after = "def check(token):\n    return token == 'ok'\n"
+    return [{"src/auth/session.py": before}, {"src/auth/session.py": after}]
 
 
 def _code_commits():
@@ -787,7 +794,8 @@ def test_stats_leave_out_skips_and_combined_records():
 
 def test_auto_tries_the_next_reviewer_after_a_timeout():
     # source: 11-12 pre-push review of this repo: auto moved on only after a usage limit, so a timed-out or
-    # logged-out cross-family reviewer let the push through unreviewed while claude was installed
+    # logged-out cross-family reviewer let the push through unreviewed while claude was installed.
+    # 2026-07-25 tightening 1 retries that timeout once before auto moves on, so the timed-out reviewer is launched twice.
     tmp, repo = _init_repo(_code_commits())
 
     def handler(cmd, **kwargs):
@@ -805,7 +813,7 @@ def test_auto_tries_the_next_reviewer_after_a_timeout():
             repo, ["--reviewer", "auto", "--author", "claude", "--range", "HEAD~1..HEAD"],
             {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex"}, handler=handler,
         )
-        assert [_exe_kind(cmd) for cmd, _ in calls] == ["codex", "claude"], calls
+        assert [_exe_kind(cmd) for cmd, _ in calls] == ["codex", "codex", "claude"], calls
         assert "review-gate: codex failed (reviewer timed out after 180s); ran claude" in out, out
         assert code == 1, out
     finally:
@@ -838,6 +846,291 @@ def test_run_helper_restores_every_variable_it_sets():
              env={"HOME": "/nonexistent-review-gate-home"})
         assert os.environ.get("HOME") == before
     finally:
+        tmp.cleanup()
+
+
+def _claude_reply(verdict, summary):
+    body = _verdict_json(verdict, summary)
+    outer = json.dumps({"type": "result", "result": body})
+    return subprocess.CompletedProcess(["claude"], 0, stdout=outer, stderr="")
+
+
+def test_default_timeout_scales_with_diff_bytes():
+    # source: 2026-07-25 tightening 2, default_timeout at 0, 60000 and 10**7 bytes gives 180, 300 and 300
+    assert rg.default_timeout(0) == 180
+    assert rg.default_timeout(60000) == 300
+    assert rg.default_timeout(10 ** 7) == 300
+
+
+def test_timeout_then_pass_on_retry_records_budgets():
+    # source: 2026-07-25 tightening 1, a timeout then a PASS on the retry gives PASS with retried in the record and the second budget at 2.5 times the first
+    tmp, repo = _init_repo(_code_commits())
+    spine = tempfile.TemporaryDirectory()
+    seen = []
+
+    def handler(cmd, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        if len(seen) == 1:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        return _claude_reply("PASS", "clean")
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--timeout", "100", "--spine-dir", spine.name,
+             "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+        )
+        assert code == 0, out + err
+        assert seen[1] == int(seen[0] * rg.INFRA_RETRY_MULT), seen
+        nodes = _spine_nodes(spine.name)
+        assert len(nodes) == 1, nodes
+        payload = nodes[0]["payload"]
+        assert payload["verdict"] == "PASS"
+        assert payload["retried"] is True
+        assert payload["attempt_budgets"] == seen
+        assert payload["attempt_budgets"][1] == int(payload["attempt_budgets"][0] * 2.5)
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
+def test_two_timeouts_on_a_noncritical_diff_fail_open():
+    # source: 2026-07-25 tightening 3, two timeouts on a non-critical diff fail open as today
+    tmp, repo = _init_repo(_code_commits())
+    spine = tempfile.TemporaryDirectory()
+
+    def handler(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--spine-dir", spine.name, "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+        )
+        assert len(calls) == 2, calls
+        assert code == 0, out + err
+        nodes = _spine_nodes(spine.name)
+        assert nodes
+        assert all(node["payload"].get("verdict") != "BLOCKED_NO_VERDICT" for node in nodes)
+        assert "could not finish" not in err
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
+def test_two_timeouts_on_a_critical_diff_exit_3():
+    # source: 2026-07-25 tightening 3, a critical diff whose reviewer times out twice blocks with exit 3
+    tmp, repo = _init_repo(_auth_commits())
+    spine = tempfile.TemporaryDirectory()
+
+    def handler(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--spine-dir", spine.name, "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+        )
+        assert len(calls) == 2, calls
+        assert code == 3, out + err
+        assert "src/auth/session.py" in err
+        assert "could not finish" in err
+        assert "--fail-open-always" in err
+        assert "git push --no-verify" in err
+        nodes = _spine_nodes(spine.name)
+        blocked = [node for node in nodes if node["payload"].get("verdict") == "BLOCKED_NO_VERDICT"]
+        assert len(blocked) == 1, nodes
+        infra = [node for node in nodes if node["payload"].get("infra_error")]
+        assert infra and infra[0]["payload"].get("retried") is True
+        budgets = infra[0]["payload"]["attempt_budgets"]
+        assert budgets[1] == int(budgets[0] * rg.INFRA_RETRY_MULT)
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
+def test_fail_open_always_on_a_critical_diff_exits_0():
+    # source: 2026-07-25 tightening 3, --fail-open-always on a critical diff with no verdict exits 0
+    tmp, repo = _init_repo(_auth_commits())
+    spine = tempfile.TemporaryDirectory()
+
+    def handler(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--fail-open-always", "--spine-dir", spine.name,
+             "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+        )
+        assert code == 0, out + err
+        assert len(calls) == 2, calls
+        nodes = _spine_nodes(spine.name)
+        assert all(node["payload"].get("verdict") != "BLOCKED_NO_VERDICT" for node in nodes)
+        assert "could not finish" not in err
+    finally:
+        spine.cleanup()
+        tmp.cleanup()
+
+
+def test_fail_open_always_env_on_a_critical_diff_exits_0():
+    # source: 2026-07-25 tightening 3, REVIEW_GATE_FAIL_OPEN_ALWAYS=1 on a critical diff with no verdict exits 0
+    tmp, repo = _init_repo(_auth_commits())
+
+    def handler(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+            env={"REVIEW_GATE_FAIL_OPEN_ALWAYS": "1"},
+        )
+        assert code == 0, out + err
+        assert len(calls) == 2, calls
+        assert "could not finish" not in err
+    finally:
+        tmp.cleanup()
+
+
+def test_explicit_timeout_5000_is_clamped_to_600():
+    # source: 2026-07-25 tightening 2, an explicit --timeout 5000 is clamped to 600
+    tmp, repo = _init_repo(_code_commits())
+
+    def handler(cmd, **kwargs):
+        return _claude_reply("PASS", "clean")
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--timeout", "5000", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+        )
+        assert code == 0, out + err
+        assert len(calls) == 1, calls
+        assert calls[0][1]["timeout"] == 600
+        assert "clamping to 600s" in err
+        assert err.count("\n") == 1
+    finally:
+        tmp.cleanup()
+
+
+def test_wall_skips_retry_when_under_30_seconds_remain():
+    # source: 2026-07-25 tightening 2, the 900s wall skips a timeout retry when under 30 seconds remain
+    tmp, repo = _init_repo(_code_commits())
+
+    def always(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--timeout", "80", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=always,
+        )
+        assert code == 0, out + err
+        assert [kwargs.get("timeout") for _, kwargs in calls] == [80, int(80 * rg.INFRA_RETRY_MULT)], calls
+
+        clock = {"now": 5000.0}
+        original = rg.time.monotonic
+        rg.time.monotonic = lambda: clock["now"]
+
+        def jump(cmd, **kwargs):
+            clock["now"] = 5000.0 + rg.MAX_TOTAL_TIMEOUT - 20
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+        try:
+            code, out, err, calls = _run(
+                repo,
+                ["--reviewer", "claude", "--timeout", "80", "--range", "HEAD~1..HEAD"],
+                {"claude": "/usr/bin/claude"},
+                handler=jump,
+            )
+            assert code == 0, out + err
+            assert [kwargs.get("timeout") for _, kwargs in calls] == [80], calls
+            assert "retrying once" not in err
+        finally:
+            rg.time.monotonic = original
+    finally:
+        tmp.cleanup()
+
+
+def test_nonzero_exit_is_not_retried():
+    # source: 2026-07-25 tightening 1, a non-zero exit is not retried; only a timeout is
+    tmp, repo = _init_repo(_code_commits())
+
+    def handler(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+        )
+        assert len(calls) == 1, calls
+        assert code == 0, out + err
+    finally:
+        tmp.cleanup()
+
+
+def test_critical_block_line_names_at_most_five_files():
+    # source: 2026-07-25 tightening 3, the stderr line names the critical files, at most five
+    files = [f"src/auth/p{i}.py" for i in range(6)]
+    assert rg.critical_paths(files) == files[:5]
+    line = rg.critical_block_line(files)
+    assert "\n" not in line
+    assert "could not finish" in line
+    assert "--fail-open-always" in line
+    assert "git push --no-verify" in line
+    assert "src/auth/p4.py" in line
+    assert "src/auth/p5.py" not in line
+
+
+def test_stats_counts_blocked_no_verdict_in_its_own_row():
+    # source: 2026-07-25 tightening 3, --stats counts BLOCKED_NO_VERDICT in its own row and never as a REJECT
+    tmp, repo = _init_repo(_auth_commits())
+    spine = tempfile.TemporaryDirectory()
+
+    def handler(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    try:
+        code, out, err, calls = _run(
+            repo,
+            ["--reviewer", "claude", "--spine-dir", spine.name, "--range", "HEAD~1..HEAD"],
+            {"claude": "/usr/bin/claude"},
+            handler=handler,
+        )
+        assert code == 3, out + err
+        rg.log_verdict(spine.name, {
+            "verdict": "REJECT",
+            "bugs": ["x"],
+            "summary": "bad",
+            "reviewer": "claude",
+        }, {"head_sha": "e" * 40, "round": 1})
+        code, out, err, calls = _run(repo, ["--stats", "--spine-dir", spine.name], {})
+        assert code == 0, err
+        blocked = next(line for line in out.splitlines() if "blocked, no verdict:" in line)
+        assert blocked.strip().endswith("1"), out
+        assert "scored (non-infra):    1" in out, out
+        assert "claude: reviews 1, REJECT 1, finding rate 100%" in out, out
+        assert "REJECT 2" not in out
+    finally:
+        spine.cleanup()
         tmp.cleanup()
 
 

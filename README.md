@@ -29,6 +29,7 @@ Each push is reviewed by a separate process that sees only the diff, the changed
 - [Example](#example)
 - [Cross-family review](#cross-family-review)
 - [Verdict rules given to the reviewer](#verdict-rules-given-to-the-reviewer)
+- [When the reviewer cannot answer](#when-the-reviewer-cannot-answer)
 - [The spine log](#the-spine-log)
 - [Tests](#tests)
 - [Related](#related)
@@ -92,7 +93,7 @@ python3 review_gate.py --range origin/main..HEAD --spec docs/spec.md
 python3 review_gate.py --stats
 ```
 
-Flags: `--model auto|sonnet|opus` (auto = Sonnet, escalating to Opus when the diff touches auth, payment, or migration paths), `--reviewer auto|claude|codex|cmd`, `--author claude|codex|other`, `--reviewers claude,codex`, `--codex-model <name>`, `--round N`, `--timeout 180`, `--spine-dir <dir>` (or `$REVIEW_GATE_SPINE_DIR`), `--no-log`.
+Flags: `--model auto|sonnet|opus` (auto = Sonnet, escalating to Opus when the diff touches auth, payment, or migration paths), `--reviewer auto|claude|codex|cmd`, `--author claude|codex|other`, `--reviewers claude,codex`, `--codex-model <name>`, `--round N`, `--timeout <seconds>` (default scales from 180 to 300 with the diff; an explicit value is clamped to 600), `--fail-open-always`, `--spine-dir <dir>` (or `$REVIEW_GATE_SPINE_DIR`), `--no-log`.
 
 `--model` chooses Sonnet or Opus for the Claude reviewer. `--codex-model` (or `$REVIEW_GATE_CODEX_MODEL`) chooses the Codex model. When it is unset, the Codex command gets no model flag.
 
@@ -135,7 +136,7 @@ Cross-family review means the reviewer is a different model family from the auth
 
 Claude is installed when `claude` is on PATH (or at `~/.local/bin/claude`). Codex is installed when `codex` is on PATH. The `cmd` reviewer is installed when `REVIEW_GATE_REVIEWER_CMD` is set. If only the author's own family is installed, auto uses it and prints `review-gate: same-family review (<family>)`. If the chosen reviewer gives no verdict because it hit a usage limit, timed out, or could not start, auto tries the next reviewer and prints which one ran. A limit is read from a usage limit, rate limit, quota, 429, or try-again message in output that holds no verdict. A reply that carries a verdict always stands, so a REJECT that mentions a rate limit still blocks, and words in the diff cannot turn a review into a limit.
 
-`--reviewers claude,codex` (or `$REVIEW_GATE_REVIEWERS`) is panel mode. Each listed reviewer sees the same prompt. The combined verdict is REJECT if any reviewer returns REJECT, WARN if any returns WARN or an infra error, and PASS otherwise. The gate prints a verdict line per reviewer and a combined line. The spine gets one record per reviewer plus one combined record with `agreement` (true when every verdict is the same, false otherwise). A `--reviewer` flag selects one reviewer and overrides `$REVIEW_GATE_REVIEWERS`. Panel reviewers run one after another, so the longest wait is `--timeout` times the number of reviewers.
+`--reviewers claude,codex` (or `$REVIEW_GATE_REVIEWERS`) is panel mode. Each listed reviewer sees the same prompt. The combined verdict is REJECT if any reviewer returns REJECT, WARN if any returns WARN or an infra error, and PASS otherwise. The gate prints a verdict line per reviewer and a combined line. The spine gets one record per reviewer plus one combined record with `agreement` (true when every verdict is the same, false otherwise). A `--reviewer` flag selects one reviewer and overrides `$REVIEW_GATE_REVIEWERS`. Panel reviewers run one after another and share one 900 second wall, including timeout retries.
 
 `--reviewer cmd` runs `$REVIEW_GATE_REVIEWER_CMD` in the shell. The command reads the prompt on stdin and prints the reply:
 
@@ -154,15 +155,16 @@ The hand loop, including `--round`, is in [docs/cross-family-loop.md](docs/cross
 
 Docs-only changes skip the reviewer, print `review-gate: docs-only change, skipped.`, list the non-source files on one line, log a SKIP record, and exit 0. A `.git/review-gate-pass` sentinel remembers the last reviewed tip so a clean re-push does not re-run the review.
 
-## Fail-open, on purpose
+## When the reviewer cannot answer
 
-If the reviewer is missing, times out, or errors, and if the gate itself crashes, the push is **allowed** with a loud WARN. Exit 1 always means "reviewed and REJECTed", never "the tooling broke". The gate is additive safety, not the only safety. Robustness details that came from real incidents live in the code comments (for example binary-safe diff decoding, and schema-echo-proof verdict parsing).
+A timeout is retried once, at 2.5 times that attempt's budget, before that reviewer counts as failed. The default budget is 180 seconds plus one second per 500 diff bytes, clamped to 180 to 300 seconds. Pass `--timeout` to set the budget; that value is clamped to 600 seconds for one attempt. Every attempt and every reviewer share a 900 second wall, and a retry is skipped when under 30 seconds remain, so the retry cannot turn a push into a long hang.
 
-Escape hatches (both intentional, both visible in your shell history):
+On a critical path (auth, payment, migration, or secrets), no usable verdict after every attempt and every reviewer blocks the push with exit 3, and the log records `BLOCKED_NO_VERDICT`. Exit 1 still means the reviewer returned REJECT. On every other change, a missing reviewer, a timeout, a bad exit, unparseable output, or a crash of the gate still allows the push with a loud WARN.
 
 ```sh
-REVIEW_GATE_SKIP=1 git push   # skip just the review
-git push --no-verify          # skip all pre-push hooks
+REVIEW_GATE_FAIL_OPEN_ALWAYS=1 git push   # --fail-open-always: allow this gate even with no verdict
+REVIEW_GATE_SKIP=1 git push               # skip just the review
+git push --no-verify                      # skip all pre-push hooks
 ```
 
 ## The spine log

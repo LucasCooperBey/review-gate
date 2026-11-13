@@ -2,6 +2,7 @@
 
 ## 2026-11-12
 
+- A timeout is retried once at 2.5 times that attempt's budget. The default budget scales from 180 seconds by one second per 500 diff bytes, up to 300, and an explicit timeout is capped at 600 seconds per attempt. All attempts and reviewers share a 900 second wall, and a retry is skipped when under 30 seconds remain. A critical path with no usable verdict after every attempt and reviewer blocks the push with exit 3 (BLOCKED_NO_VERDICT). Other diffs still fail open. --fail-open-always or REVIEW_GATE_FAIL_OPEN_ALWAYS=1 restores the old allow-on-infra behavior.
 - README: an Example section with a recorded cross-family REJECT (Codex as author, Claude as reviewer) on a change with two planted bugs.
 - Add cross-family reviewers. `--reviewer auto|claude|codex|cmd` and `--author claude|codex|other` choose a reviewer from a different family than the one that wrote the change. Auto uses the author's own family only when no other family is installed or every other family hit a usage limit, and prints that the review is same-family.
 - Add panel mode (`--reviewers` or `REVIEW_GATE_REVIEWERS`). The combined verdict is REJECT if any reviewer returns REJECT, otherwise WARN if any returns WARN or an infra error, otherwise PASS. Each reviewer is logged, plus one combined record with `agreement`.
